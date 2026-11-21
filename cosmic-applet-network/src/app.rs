@@ -303,6 +303,7 @@ pub enum NmAgentEvent {
         connection_uuid: String,
         connection_id: String,
         setting: AgentSetting,
+        allow_interaction: bool,
         responder: SecretResponderHandle,
     },
     CancelGetSecrets,
@@ -312,10 +313,20 @@ pub enum NmAgentEvent {
 #[derive(Debug, Clone)]
 pub enum AgentSetting {
     WifiPsk { ssid: String },
-    WifiEap,
+    WifiEap { identity: Option<String> },
     Vpn { secret_keys: Vec<String> },
     Other,
 }
+
+/// Pending 802.1X GetSecrets interaction for a saved profile.
+#[derive(Debug, Clone)]
+struct PendingEapSecret {
+    ssid: Arc<str>,
+    profile_has_identity: bool,
+    responder: SecretResponderHandle,
+}
+
+static SAVED_ACTIVATION_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 #[derive(Default)]
 struct CosmicNetworkApplet {
@@ -330,6 +341,7 @@ struct CosmicNetworkApplet {
     show_visible_networks: bool,
     show_available_vpns: bool,
     new_connection: Option<NewConnectionState>,
+    pending_eap_secret: Option<PendingEapSecret>,
     toggle_wifi_ctr: u128,
     token_tx: Option<calloop::channel::Sender<TokenRequest>>,
     secret_agent_reregister_tx: Option<UnboundedSender<()>>,
@@ -583,6 +595,7 @@ fn connect_saved_access_point_task(
     uuid: String,
 ) -> Task<cosmic::Action<Message>> {
     cosmic::task::future(async move {
+        let _guard = SAVED_ACTIVATION_LOCK.lock().await;
         let interface = access_point.interface.clone();
         let config = match interface.as_deref() {
             Some(interface) => ConnectByUuidConfig::default().with_interface(interface),
@@ -645,6 +658,56 @@ fn pick_profile_uuid(candidates: &[ProfileCandidate]) -> Option<&str> {
                 .then_with(|| b.uuid.cmp(&a.uuid))
         })
         .map(|c| c.uuid.as_str())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PasswordSubmitPlan<'a> {
+    AnswerSecretAgent,
+    ActivateUuid(&'a str),
+    CreateProfile,
+}
+
+fn plan_password_submit<'a>(
+    network_type: &NetworkType,
+    has_pending_request: bool,
+    uuid: Option<&'a str>,
+) -> PasswordSubmitPlan<'a> {
+    match (network_type, has_pending_request, uuid) {
+        (NetworkType::Eap, true, _) => PasswordSubmitPlan::AnswerSecretAgent,
+        (NetworkType::Eap, false, Some(uuid)) => PasswordSubmitPlan::ActivateUuid(uuid),
+        _ => PasswordSubmitPlan::CreateProfile,
+    }
+}
+
+fn eap_reply_identity(profile_has_identity: bool, typed: &str) -> Option<String> {
+    (!profile_has_identity && !typed.trim().is_empty()).then(|| typed.trim().to_owned())
+}
+
+fn answer_eap_secret_task(
+    responder: SecretResponderHandle,
+    identity: Option<String>,
+    password: SecureString,
+) -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async move {
+        let Some(r) = responder.lock().await.take() else {
+            return Message::Error("EAP secret request is no longer pending".into());
+        };
+        match r.wifi_eap(identity, password.unsecure().to_owned()).await {
+            Ok(()) => Message::NoOp,
+            Err(e) => Message::Error(format!("EAP secret reply failed: {e}")),
+        }
+    })
+    .map(cosmic::Action::App)
+}
+
+fn cancel_responder(responder: SecretResponderHandle) -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async move {
+        if let Some(r) = responder.lock().await.take() {
+            let _ = r.cancel().await;
+        }
+        Message::NoOp
+    })
+    .map(cosmic::Action::App)
 }
 
 fn snapshot_task() -> Task<Message> {
@@ -1096,7 +1159,7 @@ fn secret_agent_task(
 fn secret_request_to_event(req: SecretRequest) -> NmAgentEvent {
     let setting = match req.setting {
         SecretSetting::WifiPsk { ssid } => AgentSetting::WifiPsk { ssid },
-        SecretSetting::WifiEap { .. } => AgentSetting::WifiEap,
+        SecretSetting::WifiEap { identity, .. } => AgentSetting::WifiEap { identity },
         SecretSetting::Vpn { .. } => AgentSetting::Vpn {
             secret_keys: req.hints.clone(),
         },
@@ -1107,6 +1170,9 @@ fn secret_request_to_event(req: SecretRequest) -> NmAgentEvent {
         connection_uuid: req.connection_uuid,
         connection_id: req.connection_id,
         setting,
+        allow_interaction: req
+            .flags
+            .contains(nmrs::agent::SecretAgentFlags::ALLOW_INTERACTION),
         responder: Arc::new(AsyncMutex::new(Some(req.responder))),
     }
 }
@@ -1283,7 +1349,12 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .known_access_points
                         .iter()
                         .any(|known| same_access_point(known, &access_point));
-                    if known {
+                    let eap_saved = matches!(access_point.network_type, NetworkType::Eap)
+                        && self
+                            .nm_state
+                            .ssid_to_uuid
+                            .contains_key(access_point.ssid.as_ref());
+                    if known || eap_saved {
                         self.new_connection =
                             Some(NewConnectionState::Waiting(access_point.clone()));
                         let uuid = self
@@ -1337,6 +1408,9 @@ impl cosmic::Application for CosmicNetworkApplet {
             Message::NoOp => {}
             Message::CancelNewConnection => {
                 self.new_connection = None;
+                if let Some(pending) = self.pending_eap_secret.take() {
+                    return cancel_responder(pending.responder);
+                }
             }
             Message::CloseRequested(id) => {
                 if Some(id) == self.popup {
@@ -1541,9 +1615,46 @@ impl cosmic::Application for CosmicNetworkApplet {
                     ..
                 }) = self.new_connection.take()
                 {
-                    self.new_connection
-                        .replace(NewConnectionState::Waiting(access_point.clone()));
-                    return connect_access_point_task(access_point, Some(identity), Some(password));
+                    let known_uuid = self
+                        .nm_state
+                        .ssid_to_uuid
+                        .get(access_point.ssid.as_ref())
+                        .cloned();
+                    let has_pending = self
+                        .pending_eap_secret
+                        .as_ref()
+                        .is_some_and(|p| p.ssid == access_point.ssid);
+                    match plan_password_submit(
+                        &access_point.network_type,
+                        has_pending,
+                        known_uuid.as_deref(),
+                    ) {
+                        PasswordSubmitPlan::AnswerSecretAgent => {
+                            let Some(pending) = self.pending_eap_secret.take() else {
+                                return Task::none();
+                            };
+                            self.new_connection
+                                .replace(NewConnectionState::Waiting(access_point));
+                            let identity =
+                                eap_reply_identity(pending.profile_has_identity, &identity);
+                            return answer_eap_secret_task(pending.responder, identity, password);
+                        }
+                        PasswordSubmitPlan::ActivateUuid(uuid) => {
+                            let uuid = uuid.to_owned();
+                            self.new_connection
+                                .replace(NewConnectionState::Waiting(access_point.clone()));
+                            return connect_saved_access_point_task(access_point, uuid);
+                        }
+                        PasswordSubmitPlan::CreateProfile => {
+                            self.new_connection
+                                .replace(NewConnectionState::Waiting(access_point.clone()));
+                            return connect_access_point_task(
+                                access_point,
+                                Some(identity),
+                                Some(password),
+                            );
+                        }
+                    }
                 }
             }
             Message::Disconnect(ssid, hw_address) => {
@@ -1595,6 +1706,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                 success,
                 error,
             } => {
+                self.pending_eap_secret = None;
                 if success {
                     self.failed_known_ssids.remove(access_point.ssid.as_ref());
                     self.new_connection = None;
@@ -1650,6 +1762,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                     connection_uuid,
                     connection_id,
                     setting,
+                    allow_interaction,
                     responder,
                 } => {
                     let description = (!connection_id.is_empty()).then_some(connection_id);
@@ -1659,6 +1772,7 @@ impl cosmic::Application for CosmicNetworkApplet {
                         .contains_key(connection_uuid.as_str());
 
                     let mut consumed = false;
+                    let mut superseded: Option<SecretResponderHandle> = None;
 
                     if let Some(state) = self.new_connection.as_mut() {
                         match state {
@@ -1678,14 +1792,35 @@ impl cosmic::Application for CosmicNetworkApplet {
                                         ap_uuid.as_ref() == connection_uuid.as_str()
                                     });
 
-                                if matches_ssid || matches_uuid {
+                                let eap_identity = match &setting {
+                                    AgentSetting::WifiEap { identity } => Some(identity.clone()),
+                                    _ => None,
+                                };
+                                let prompt = match eap_identity {
+                                    Some(_) => matches_uuid && allow_interaction,
+                                    None => matches_ssid || matches_uuid,
+                                };
+                                if prompt {
+                                    let profile_identity = eap_identity.clone().flatten();
+                                    let ap = access_point.clone();
                                     *state = NewConnectionState::EnterPassword {
-                                        access_point: access_point.clone(),
+                                        access_point: ap.clone(),
                                         description: description.clone(),
-                                        identity: String::new(),
+                                        identity: profile_identity.clone().unwrap_or_default(),
                                         password: String::new().into(),
                                         password_hidden: true,
                                     };
+                                    if eap_identity.is_some() {
+                                        let previous =
+                                            self.pending_eap_secret.replace(PendingEapSecret {
+                                                ssid: ap.ssid.clone(),
+                                                profile_has_identity: profile_identity
+                                                    .is_some_and(|i| !i.is_empty()),
+                                                responder: responder.clone(),
+                                            });
+                                        superseded = previous.map(|p| p.responder);
+                                        consumed = true;
+                                    }
                                 }
                             }
                         }
@@ -1711,9 +1846,13 @@ impl cosmic::Application for CosmicNetworkApplet {
                     if !consumed {
                         return release_responder(responder);
                     }
+                    if let Some(previous) = superseded {
+                        return release_responder(previous);
+                    }
                 }
                 NmAgentEvent::CancelGetSecrets => {
                     self.new_connection = None;
+                    self.pending_eap_secret = None;
                     self.nm_state.requested_vpn = None;
                 }
                 NmAgentEvent::Failed(error) => {
@@ -2480,6 +2619,46 @@ mod eap_profile_tests {
             assert_eq!(plan_known_connect(&t, Some("u")), KnownConnectPlan::Legacy);
             assert_eq!(plan_known_connect(&t, None), KnownConnectPlan::Legacy);
         }
+    }
+
+    #[test]
+    fn eap_submit_with_pending_request_answers_agent() {
+        assert_eq!(
+            plan_password_submit(&NetworkType::Eap, true, Some("u")),
+            PasswordSubmitPlan::AnswerSecretAgent
+        );
+    }
+
+    #[test]
+    fn eap_submit_without_request_reactivates_stored_profile_never_rebuilds() {
+        assert_eq!(
+            plan_password_submit(&NetworkType::Eap, false, Some("u")),
+            PasswordSubmitPlan::ActivateUuid("u")
+        );
+    }
+
+    #[test]
+    fn new_eap_and_personal_networks_create_profile() {
+        assert_eq!(
+            plan_password_submit(&NetworkType::Eap, false, None),
+            PasswordSubmitPlan::CreateProfile
+        );
+        for has_pending in [false, true] {
+            assert_eq!(
+                plan_password_submit(&NetworkType::Password, has_pending, Some("u")),
+                PasswordSubmitPlan::CreateProfile
+            );
+        }
+    }
+
+    #[test]
+    fn identity_only_sent_when_profile_lacks_one() {
+        assert_eq!(eap_reply_identity(true, "user@uni.de"), None);
+        assert_eq!(eap_reply_identity(false, "  "), None);
+        assert_eq!(
+            eap_reply_identity(false, " user@uni.de "),
+            Some("user@uni.de".into())
+        );
     }
 
     #[test]

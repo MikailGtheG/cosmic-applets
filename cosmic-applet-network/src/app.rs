@@ -535,15 +535,21 @@ fn wifi_security(
 ) -> WifiSecurity {
     match access_point.network_type {
         NetworkType::Open => WifiSecurity::Open,
-        NetworkType::Eap => WifiSecurity::WpaEap {
-            opts: EapOptions::new(
+        NetworkType::Eap => {
+            let mut opts = EapOptions::new(
                 identity.unwrap_or_default(),
                 password
                     .as_ref()
                     .map(|password| password.unsecure().to_owned())
                     .unwrap_or_default(),
-            ),
-        },
+            );
+            // A profile created from this form has no pinned CA. Validate the
+            // RADIUS server certificate against the system trust store rather
+            // than skipping validation; provisioned profiles carry their own
+            // CA and never take this path.
+            opts.system_ca_certs = true;
+            WifiSecurity::WpaEap { opts }
+        }
         NetworkType::Password => WifiSecurity::WpaPsk {
             psk: password
                 .as_ref()
@@ -677,6 +683,11 @@ fn plan_password_submit<'a>(
         (NetworkType::Eap, false, Some(uuid)) => PasswordSubmitPlan::ActivateUuid(uuid),
         _ => PasswordSubmitPlan::CreateProfile,
     }
+}
+
+/// A finished attempt only invalidates a pending secret request for the same SSID.
+fn pending_secret_is_stale(pending: Option<&PendingEapSecret>, finished_ssid: &str) -> bool {
+    pending.is_some_and(|p| p.ssid.as_ref() == finished_ssid)
 }
 
 fn eap_reply_identity(profile_has_identity: bool, typed: &str) -> Option<String> {
@@ -1706,7 +1717,9 @@ impl cosmic::Application for CosmicNetworkApplet {
                 success,
                 error,
             } => {
-                self.pending_eap_secret = None;
+                if pending_secret_is_stale(self.pending_eap_secret.as_ref(), &access_point.ssid) {
+                    self.pending_eap_secret = None;
+                }
                 if success {
                     self.failed_known_ssids.remove(access_point.ssid.as_ref());
                     self.new_connection = None;
@@ -2648,6 +2661,36 @@ mod eap_profile_tests {
                 plan_password_submit(&NetworkType::Password, has_pending, Some("u")),
                 PasswordSubmitPlan::CreateProfile
             );
+        }
+    }
+
+    #[test]
+    fn finished_attempt_only_clears_pending_secret_of_same_ssid() {
+        let pending = PendingEapSecret {
+            ssid: Arc::from("eduroam"),
+            profile_has_identity: true,
+            responder: Arc::new(AsyncMutex::new(None)),
+        };
+        assert!(pending_secret_is_stale(Some(&pending), "eduroam"));
+        assert!(!pending_secret_is_stale(Some(&pending), "other"));
+        assert!(!pending_secret_is_stale(None, "eduroam"));
+    }
+
+    #[test]
+    fn new_enterprise_profiles_validate_server_certificate() {
+        let ap = AccessPoint {
+            ssid: Arc::from("eduroam"),
+            network_type: NetworkType::Eap,
+            hw_address: HwAddress::default(),
+            strength: 0,
+            state: DeviceState::Unknown,
+            working: false,
+            wps_push: false,
+            interface: None,
+        };
+        match wifi_security(&ap, Some("u".into()), Some("p".to_string().into())) {
+            WifiSecurity::WpaEap { opts } => assert!(opts.system_ca_certs),
+            _ => panic!("expected WpaEap"),
         }
     }
 

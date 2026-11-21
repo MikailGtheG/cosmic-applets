@@ -574,6 +574,36 @@ fn connect_access_point_task(
     .map(cosmic::Action::App)
 }
 
+/// Activate an existing NetworkManager profile without rebuilding its 802.1X
+/// settings. Provisioners such as geteduroam install CA certificates, EAP
+/// methods and identities that must not be replaced with UI defaults.
+fn connect_saved_access_point_task(
+    access_point: AccessPoint,
+    uuid: String,
+) -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async move {
+        match NmrsManager::new().await {
+            Ok(nm) => match nm
+                .connect_by_uuid(&uuid, ConnectByUuidConfig::default())
+                .await
+            {
+                Ok(()) => Message::ConnectionAttemptFinished {
+                    access_point,
+                    success: true,
+                    error: None,
+                },
+                Err(e) => Message::ConnectionAttemptFinished {
+                    access_point,
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            },
+            Err(e) => Message::Error(format!("nmrs init: {e}")),
+        }
+    })
+    .map(cosmic::Action::App)
+}
+
 fn snapshot_task() -> Task<Message> {
     cosmic::task::future(async move {
         let nm = match NmrsManager::new().await {
@@ -1190,6 +1220,18 @@ impl cosmic::Application for CosmicNetworkApplet {
                     if known {
                         self.new_connection =
                             Some(NewConnectionState::Waiting(access_point.clone()));
+                        if let Some(uuid) = self
+                            .nm_state
+                            .ssid_to_uuid
+                            .get(access_point.ssid.as_ref())
+                        {
+                            return connect_saved_access_point_task(access_point, uuid.to_string());
+                        }
+                        if matches!(access_point.network_type, NetworkType::Eap) {
+                            return cosmic::task::message(cosmic::Action::App(Message::Error(
+                                "Saved enterprise Wi-Fi profile has no UUID; refresh network connections".into(),
+                            )));
+                        }
                         return connect_access_point_task(access_point, None, None);
                     }
                     self.new_connection = Some(NewConnectionState::EnterPassword {
@@ -1290,6 +1332,17 @@ impl cosmic::Application for CosmicNetworkApplet {
                     return Task::none();
                 };
                 self.show_visible_networks = true;
+                // A provisioned EAP profile may contain CA pinning, inner EAP
+                // method, client certificates and private-key references.
+                // A reset must never delete it or replace it with defaults.
+                if matches!(ap.network_type, NetworkType::Eap) {
+                    return match self.nm_state.ssid_to_uuid.get(ssid.as_str()) {
+                        Some(uuid) => connect_saved_access_point_task(ap, uuid.to_string()),
+                        None => cosmic::task::message(cosmic::Action::App(Message::Error(
+                            "Cannot retry enterprise Wi-Fi: saved profile UUID unavailable".into(),
+                        ))),
+                    };
+                }
                 let ssid_for_task = ssid.clone();
                 let forget_task = cosmic::task::future(async move {
                     match NmrsManager::new().await {
@@ -1376,6 +1429,14 @@ impl cosmic::Application for CosmicNetworkApplet {
                     .find(|c| c.ssid == ssid && c.hw_address == hw_address)
                 {
                     ap.working = true;
+                    if let Some(uuid) = self.nm_state.ssid_to_uuid.get(ssid.as_ref()) {
+                        return connect_saved_access_point_task(ap.clone(), uuid.to_string());
+                    }
+                    if matches!(ap.network_type, NetworkType::Eap) {
+                        return cosmic::task::message(cosmic::Action::App(Message::Error(
+                            "Cannot activate enterprise Wi-Fi: saved profile UUID unavailable".into(),
+                        )));
+                    }
                     return connect_access_point_task(ap.clone(), None, None);
                 }
             }

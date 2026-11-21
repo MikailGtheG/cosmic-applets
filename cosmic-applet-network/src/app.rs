@@ -1,7 +1,8 @@
 use indexmap::IndexMap;
 use nmrs::{
     ActiveConnection, ActiveConnectionState, ConnectByUuidConfig, ConnectType, ConnectivityState,
-    EapOptions, NetworkEvent, NetworkManager as NmrsManager, NetworkSnapshot, WifiSecurity,
+    EapOptions, NetworkEvent, NetworkManager as NmrsManager, NetworkSnapshot, SettingsSummary,
+    WifiKeyMgmt, WifiSecurity,
     agent::{SecretAgent, SecretAgentCapabilities, SecretRequest, SecretResponder, SecretSetting},
 };
 use rustc_hash::FxHashSet;
@@ -582,11 +583,13 @@ fn connect_saved_access_point_task(
     uuid: String,
 ) -> Task<cosmic::Action<Message>> {
     cosmic::task::future(async move {
+        let interface = access_point.interface.clone();
+        let config = match interface.as_deref() {
+            Some(interface) => ConnectByUuidConfig::default().with_interface(interface),
+            None => ConnectByUuidConfig::default(),
+        };
         match NmrsManager::new().await {
-            Ok(nm) => match nm
-                .connect_by_uuid(&uuid, ConnectByUuidConfig::default())
-                .await
-            {
+            Ok(nm) => match nm.connect_by_uuid(&uuid, config).await {
                 Ok(()) => Message::ConnectionAttemptFinished {
                     access_point,
                     success: true,
@@ -602,6 +605,46 @@ fn connect_saved_access_point_task(
         }
     })
     .map(cosmic::Action::App)
+}
+
+/// Plan how a known Wi-Fi access point should be connected.
+#[derive(Debug, PartialEq, Eq)]
+enum KnownConnectPlan<'a> {
+    ActivateUuid(&'a str),
+    MissingEapUuid,
+    Legacy,
+}
+
+fn plan_known_connect<'a>(
+    network_type: &NetworkType,
+    uuid: Option<&'a str>,
+) -> KnownConnectPlan<'a> {
+    match (network_type, uuid) {
+        (NetworkType::Eap, Some(uuid)) => KnownConnectPlan::ActivateUuid(uuid),
+        (NetworkType::Eap, None) => KnownConnectPlan::MissingEapUuid,
+        _ => KnownConnectPlan::Legacy,
+    }
+}
+
+/// Select a saved Wi-Fi profile independent of D-Bus iteration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileCandidate {
+    uuid: String,
+    is_active: bool,
+    is_eap: bool,
+    last_used_unix: u64,
+    autoconnect: bool,
+}
+
+fn pick_profile_uuid(candidates: &[ProfileCandidate]) -> Option<&str> {
+    candidates
+        .iter()
+        .max_by(|a, b| {
+            (a.is_active, a.is_eap, a.last_used_unix, a.autoconnect)
+                .cmp(&(b.is_active, b.is_eap, b.last_used_unix, b.autoconnect))
+                .then_with(|| b.uuid.cmp(&a.uuid))
+        })
+        .map(|c| c.uuid.as_str())
 }
 
 fn snapshot_task() -> Task<Message> {
@@ -666,13 +709,36 @@ fn snapshot_to_applet(snapshot: NetworkSnapshot) -> AppletSnapshot {
         known_vpns.insert(uuid, entry);
     }
 
+    let active_uuids: FxHashSet<&str> = snapshot
+        .active_connections
+        .iter()
+        .filter_map(|conn| match conn {
+            ActiveConnection::Wifi(wifi) => Some(wifi.uuid.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut candidates: BTreeMap<&str, Vec<ProfileCandidate>> = BTreeMap::new();
+    for profile in &snapshot.saved_wifi_profiles {
+        let SettingsSummary::Wifi { ssid, security, .. } = &profile.summary else {
+            continue;
+        };
+        candidates
+            .entry(ssid.as_str())
+            .or_default()
+            .push(ProfileCandidate {
+                uuid: profile.uuid.clone(),
+                is_active: active_uuids.contains(profile.uuid.as_str()),
+                is_eap: security
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.key_mgmt, WifiKeyMgmt::WpaEap)),
+                last_used_unix: profile.timestamp_unix,
+                autoconnect: profile.autoconnect,
+            });
+    }
     let mut ssid_to_uuid = BTreeMap::new();
-    for (ssid, profiles) in &summary.known_wifi {
-        if let Some(profile) = profiles.first() {
-            ssid_to_uuid.insert(
-                ssid.clone().into_boxed_str(),
-                profile.uuid.clone().into_boxed_str(),
-            );
+    for (ssid, profiles) in candidates {
+        if let Some(uuid) = pick_profile_uuid(&profiles) {
+            ssid_to_uuid.insert(ssid.into(), uuid.into());
         }
     }
 
@@ -1220,17 +1286,25 @@ impl cosmic::Application for CosmicNetworkApplet {
                     if known {
                         self.new_connection =
                             Some(NewConnectionState::Waiting(access_point.clone()));
-                        if let Some(uuid) = self
+                        let uuid = self
                             .nm_state
                             .ssid_to_uuid
                             .get(access_point.ssid.as_ref())
-                        {
-                            return connect_saved_access_point_task(access_point, uuid.to_string());
-                        }
-                        if matches!(access_point.network_type, NetworkType::Eap) {
-                            return cosmic::task::message(cosmic::Action::App(Message::Error(
-                                "Saved enterprise Wi-Fi profile has no UUID; refresh network connections".into(),
-                            )));
+                            .map(|uuid| uuid.as_ref());
+                        match plan_known_connect(&access_point.network_type, uuid) {
+                            KnownConnectPlan::ActivateUuid(uuid) => {
+                                let uuid = uuid.to_owned();
+                                return connect_saved_access_point_task(access_point, uuid);
+                            }
+                            KnownConnectPlan::MissingEapUuid => {
+                                return cosmic::task::message(cosmic::Action::App(
+                                    Message::Error(
+                                        "Saved enterprise Wi-Fi profile has no UUID; refresh network connections"
+                                            .into(),
+                                    ),
+                                ));
+                            }
+                            KnownConnectPlan::Legacy => {}
                         }
                         return connect_access_point_task(access_point, None, None);
                     }
@@ -1335,13 +1409,22 @@ impl cosmic::Application for CosmicNetworkApplet {
                 // A provisioned EAP profile may contain CA pinning, inner EAP
                 // method, client certificates and private-key references.
                 // A reset must never delete it or replace it with defaults.
-                if matches!(ap.network_type, NetworkType::Eap) {
-                    return match self.nm_state.ssid_to_uuid.get(ssid.as_str()) {
-                        Some(uuid) => connect_saved_access_point_task(ap, uuid.to_string()),
-                        None => cosmic::task::message(cosmic::Action::App(Message::Error(
+                let uuid = self
+                    .nm_state
+                    .ssid_to_uuid
+                    .get(ssid.as_str())
+                    .map(|uuid| uuid.as_ref());
+                match plan_known_connect(&ap.network_type, uuid) {
+                    KnownConnectPlan::ActivateUuid(uuid) => {
+                        let uuid = uuid.to_owned();
+                        return connect_saved_access_point_task(ap, uuid);
+                    }
+                    KnownConnectPlan::MissingEapUuid => {
+                        return cosmic::task::message(cosmic::Action::App(Message::Error(
                             "Cannot retry enterprise Wi-Fi: saved profile UUID unavailable".into(),
-                        ))),
-                    };
+                        )));
+                    }
+                    KnownConnectPlan::Legacy => {}
                 }
                 let ssid_for_task = ssid.clone();
                 let forget_task = cosmic::task::future(async move {
@@ -1429,13 +1512,23 @@ impl cosmic::Application for CosmicNetworkApplet {
                     .find(|c| c.ssid == ssid && c.hw_address == hw_address)
                 {
                     ap.working = true;
-                    if let Some(uuid) = self.nm_state.ssid_to_uuid.get(ssid.as_ref()) {
-                        return connect_saved_access_point_task(ap.clone(), uuid.to_string());
-                    }
-                    if matches!(ap.network_type, NetworkType::Eap) {
-                        return cosmic::task::message(cosmic::Action::App(Message::Error(
-                            "Cannot activate enterprise Wi-Fi: saved profile UUID unavailable".into(),
-                        )));
+                    let uuid = self
+                        .nm_state
+                        .ssid_to_uuid
+                        .get(ssid.as_ref())
+                        .map(|uuid| uuid.as_ref());
+                    match plan_known_connect(&ap.network_type, uuid) {
+                        KnownConnectPlan::ActivateUuid(uuid) => {
+                            let uuid = uuid.to_owned();
+                            return connect_saved_access_point_task(ap.clone(), uuid);
+                        }
+                        KnownConnectPlan::MissingEapUuid => {
+                            return cosmic::task::message(cosmic::Action::App(Message::Error(
+                                "Cannot activate enterprise Wi-Fi: saved profile UUID unavailable"
+                                    .into(),
+                            )));
+                        }
+                        KnownConnectPlan::Legacy => {}
                     }
                     return connect_access_point_task(ap.clone(), None, None);
                 }
@@ -2348,5 +2441,93 @@ fn active_conn_hw_address(conn: &ActiveConnectionInfo) -> HwAddress {
             HwAddress::from_str(hw_address).unwrap_or_default()
         }
         ActiveConnectionInfo::Vpn { .. } => HwAddress::default(),
+    }
+}
+
+#[cfg(test)]
+mod eap_profile_tests {
+    use super::*;
+
+    fn cand(uuid: &str, is_active: bool, is_eap: bool, last: u64, auto: bool) -> ProfileCandidate {
+        ProfileCandidate {
+            uuid: uuid.into(),
+            is_active,
+            is_eap,
+            last_used_unix: last,
+            autoconnect: auto,
+        }
+    }
+
+    #[test]
+    fn eap_with_uuid_activates_stored_profile() {
+        assert_eq!(
+            plan_known_connect(&NetworkType::Eap, Some("u-1")),
+            KnownConnectPlan::ActivateUuid("u-1")
+        );
+    }
+
+    #[test]
+    fn eap_without_uuid_never_falls_back_to_rebuild() {
+        assert_eq!(
+            plan_known_connect(&NetworkType::Eap, None),
+            KnownConnectPlan::MissingEapUuid
+        );
+    }
+
+    #[test]
+    fn personal_and_open_keep_legacy_path_even_with_uuid() {
+        for t in [NetworkType::Password, NetworkType::Open] {
+            assert_eq!(plan_known_connect(&t, Some("u")), KnownConnectPlan::Legacy);
+            assert_eq!(plan_known_connect(&t, None), KnownConnectPlan::Legacy);
+        }
+    }
+
+    #[test]
+    fn no_candidates_yields_none() {
+        assert_eq!(pick_profile_uuid(&[]), None);
+    }
+
+    #[test]
+    fn active_profile_wins_over_everything() {
+        let c = [
+            cand("a", false, true, 900, true),
+            cand("b", true, false, 0, false),
+        ];
+        assert_eq!(pick_profile_uuid(&c), Some("b"));
+    }
+
+    #[test]
+    fn eap_profile_preferred_over_stale_personal_profile() {
+        let c = [
+            cand("psk", false, false, 500, true),
+            cand("eap", false, true, 10, true),
+        ];
+        assert_eq!(pick_profile_uuid(&c), Some("eap"));
+    }
+
+    #[test]
+    fn newest_successful_profile_wins_among_equal_eap_profiles() {
+        let c = [
+            cand("old", false, true, 100, true),
+            cand("new", false, true, 200, true),
+        ];
+        assert_eq!(pick_profile_uuid(&c), Some("new"));
+    }
+
+    #[test]
+    fn selection_is_independent_of_input_order() {
+        let a = cand("aaa", false, true, 0, true);
+        let b = cand("bbb", false, true, 0, true);
+        assert_eq!(
+            pick_profile_uuid(&[a.clone(), b.clone()]),
+            pick_profile_uuid(&[b, a])
+        );
+        assert_eq!(
+            pick_profile_uuid(&[
+                cand("bbb", false, true, 0, true),
+                cand("aaa", false, true, 0, true)
+            ]),
+            Some("aaa")
+        );
     }
 }
